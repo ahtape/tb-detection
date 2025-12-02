@@ -1,2 +1,7 @@
 # Image Folder
 TB_Chest_Radiography_Database/
+
+# file dari kode
+*.npy
+*.pkl
+*.csv
