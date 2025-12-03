@@ -2,8 +2,9 @@
 TB_Chest_Radiography_Database/
 test_data/
 
-detection/__pycache__/
-detection/temp_mask
+__pycache__
+temp_mask
+uploads
 
 # file dari kode
 *.npy

@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TB Detection ML </title>
+
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-gray-100 min-h-screen">
+
+<div class="max-w-xl mx-auto mt-10 bg-white p-6 rounded-xl shadow-lg">
+
+    <h1 class="text-2xl font-bold text-center mb-6">TB Chest X-Ray Prediction</h1>
+
+    <!-- Upload Form -->
+    <form method="post" enctype="multipart/form-data" id="uploadForm">
+        {{ form.hidden_tag() }}
+
+        <label class="block mb-2 font-medium">Select Image</label>
+        {{ form.photo(class="block w-full text-sm text-gray-900 border border-gray-300 rounded-lg cursor-pointer bg-gray-50 p-2") }}
+
+        <div class="mt-4">
+            <img id="previewImage" class="hidden w-64 mx-auto rounded-lg shadow" />
+        </div>
+
+        {{ form.submit(class="mt-4 bg-blue-600 text-white px-4 py-2 rounded-lg w-full hover:bg-blue-700") }}
+    </form>
+
+    <!-- RESULT VISUALIZATION -->
+    {% if prediction %}
+    <div class="mt-8 border-t pt-6">
+
+        <!-- PROBABILITY SECTION -->
+        <h2 class="text-xl font-semibold mb-4">Prediction Result</h2>
+
+        {% if file_url %}
+        <div class="mt-6 text-center">
+            <img src="{{ file_url }}"
+                alt="Uploaded Image"
+                class="block mx-auto max-w-xs rounded-xl shadow">
+        </div>
+        {% endif %}
+
+        <!-- Normal probability -->
+        <div class="mb-4">
+            <p class="font-medium text-green-600">
+                Normal: {{ (prediction.probability_Normal * 100) | round(2) }}%
+            </p>
+            <div class="w-full bg-gray-200 h-3 rounded">
+                <div class="bg-green-500 h-3 rounded"
+                     style="width: {{ prediction.probability_Normal * 100 }}%">
+                </div>
+            </div>
+        </div>
+
+        <!-- TB probability -->
+        <div class="mb-6">
+            <p class="font-medium text-red-600">
+                Tuberculosis: {{ (prediction.probability_TB * 100) | round(2) }}%
+            </p>
+            <div class="w-full bg-gray-200 h-3 rounded">
+                <div class="bg-red-500 h-3 rounded"
+                     style="width: {{ prediction.probability_TB * 100 }}%">
+                </div>
+            </div>
+        </div>
+
+        <!-- CLINICAL GROUP SCORES -->
+        <h3 class="text-lg font-semibold mt-6 mb-2">Clinical Indicators</h3>
+
+        {% for key, val in prediction.clinical_groups.items() %}
+        <div class="mb-4">
+            <p class="font-medium">{{ key }}:
+                {{ (val * 100) | round(1) }}%
+            </p>
+            <div class="w-full bg-gray-200 h-2 rounded">
+                <div class="bg-blue-500 h-2 rounded"
+                     style="width: {{ val * 100 }}%">
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+
+        <!-- EXPLANATION -->
+        <div class="mt-6 p-4 bg-gray-100 border rounded-lg">
+            <h4 class="font-semibold mb-2">Explanation</h4>
+            <p class="text-gray-700">{{ prediction.explanation }}</p>
+        </div>
+
+    </div>
+    {% endif %}
+
+</div>
+
+
+<!-- JS for preview and disabling button -->
+<script>
+    const fileInput = document.querySelector("input[type='file']");
+    const previewImage = document.getElementById("previewImage");
+    const submitBtn = document.querySelector("input[type='submit']");
+    const form = document.getElementById("uploadForm");
+
+    fileInput.addEventListener("change", function () {
+        const file = this.files[0];
+        if (file) {
+            const reader = new FileReader();
+            reader.onload = e => {
+                previewImage.src = e.target.result;
+                previewImage.classList.remove("hidden");
+            };
+            reader.readAsDataURL(file);
+        }
+    });
+
+    form.addEventListener("submit", () => {
+        submitBtn.value = "Processing...";
+        submitBtn.disabled = true;
+        submitBtn.classList.add("bg-gray-400");
+    });
+</script>
+
+</body>
+</html>
