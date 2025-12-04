@@ -8,13 +8,14 @@ from wtforms import SubmitField
 from script.tb_detect import predict_tb
 
 import os
-import json
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your_secret_key'
-app.config['UPLOAD_FOLDER'] = 'uploads'
 
+# ---- FIX: Make UPLOAD_FOLDER absolute ----
+app.config['UPLOAD_FOLDER'] = os.path.join(app.root_path, 'uploads')
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
 
 class UploadForm(FlaskForm):
     photo = FileField('Photo', validators=[
@@ -23,9 +24,12 @@ class UploadForm(FlaskForm):
     ])
     submit = SubmitField('Analyze')
 
+
 @app.route('/uploads/<filename>')
 def get_file(filename):
+    # Use absolute directory
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
 
 @app.route('/', methods=['GET', 'POST'])
 def upload_image():
@@ -40,9 +44,10 @@ def upload_image():
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
 
+        # URL for HTML
         file_url = url_for('get_file', filename=filename)
 
-        # Run prediction
+        # ML prediction
         prediction = predict_tb(filepath)
 
         return render_template(
@@ -52,13 +57,8 @@ def upload_image():
             prediction=prediction
         )
 
+    return render_template("index.html", form=form, file_url=file_url, prediction=prediction)
 
-    return render_template(
-            "index.html",
-            form=form,
-            file_url=file_url,
-            prediction=prediction
-        )
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=8080, debug=True)
+    app.run(host="0.0.0.0", port=5050, debug=True)

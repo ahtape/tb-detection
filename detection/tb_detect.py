@@ -1,3 +1,4 @@
+# script/tb_detect.py
 import os
 import cv2
 import numpy as np
@@ -8,18 +9,20 @@ from skimage import filters, morphology, measure
 from skimage.feature import graycomatrix, graycoprops, local_binary_pattern
 from scipy.special import expit as sigmoid
 
-
 # Global config
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-MODEL_PATH = "./models/svm_model.pkl"
-MASK_OUTPUT_DIR = "./masks/"
-ENHANCED_IMAGE_DIR = "./images/"
-TMP_MASK_DIR = "./temp_mask/"      # mask sementara jika prediksi 1 gambar
+MODEL_PATH = os.path.join(BASE_DIR, "models", "lr_model.pkl")
+MASK_OUTPUT_DIR = os.path.join(BASE_DIR, "masks")
+ENHANCED_IMAGE_DIR = os.path.join(BASE_DIR, "images")
+TMP_MASK_DIR = os.path.join(BASE_DIR, "temp_mask")
+
 os.makedirs(TMP_MASK_DIR, exist_ok=True)
 
 
+# -------------------------
 # LUNG AREA SEGMENTATION
-
+# -------------------------
 def segment_lung(image_path, output_prefix):
     img = cv2.imread(image_path)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -54,7 +57,10 @@ def segment_lung(image_path, output_prefix):
     left_mask  = np.zeros_like(total_mask); left_mask[:, mid_x:] = total_mask[:, mid_x:]
 
     ys, xs = np.where(total_mask == 1)
-    center_y = (ys.max() + ys.min()) // 2
+    if len(ys) == 0:
+        center_y = h // 2
+    else:
+        center_y = (ys.max() + ys.min()) // 2
 
     upper_mask = np.zeros_like(total_mask); upper_mask[:center_y, :] = total_mask[:center_y, :]
     lower_mask = np.zeros_like(total_mask); lower_mask[center_y:, :] = total_mask[center_y:, :]
@@ -69,19 +75,98 @@ def segment_lung(image_path, output_prefix):
     return TMP_MASK_DIR
 
 
+# -------------------------
+# HEATMAP GENERATION
+# -------------------------
+def generate_zonal_heatmap(original_img, masks, scores):
+    """
+    Create a heatmap overlay based on zonal clinical abnormality scores.
+    Accepts `scores` dict with keys:
+      - Upper_zone_score or Upper_zone_opacity_score
+      - Lower_zone_score or Lower_zone_consolidation_score
+      - Texture_score or Miliary_texture_score
+      - Asymmetry_score or Left_right_asymmetry_score
+      - asym_left_right (numeric signed asymmetry)
+    """
+    # ensure grayscale -> BGR
+    if len(original_img.shape) == 2:
+        base = cv2.cvtColor(original_img, cv2.COLOR_GRAY2BGR)
+    else:
+        base = original_img.copy()
 
+    heatmap = np.zeros_like(base, dtype=np.float32)
+
+    # robust access to clinical keys (supports older and newer names)
+    s_upper = float(scores.get("Upper_zone_score",
+                 scores.get("Upper_zone_opacity_score", 0.0)))
+    s_lower = float(scores.get("Lower_zone_score",
+                 scores.get("Lower_zone_consolidation_score", 0.0)))
+    s_texture = float(scores.get("Texture_score",
+                   scores.get("Miliary_texture_score", 0.0)))
+    s_asym = float(scores.get("Asymmetry_score",
+               scores.get("Left_right_asymmetry_score", 0.0)))
+    asym_lr = float(scores.get("asym_left_right", 0.0))
+
+    # clamp 0..1
+    s_upper = np.clip(s_upper, 0.0, 1.0)
+    s_lower = np.clip(s_lower, 0.0, 1.0)
+    s_texture = np.clip(s_texture, 0.0, 1.0)
+    s_asym = np.clip(s_asym, 0.0, 1.0)
+
+    # color definitions (BGR arrays)
+    upper_color = np.array([0, 0, 255 * s_upper], dtype=np.float32)       # red-ish
+    lower_color = np.array([255 * s_lower, 0, 0], dtype=np.float32)       # blue-ish
+    texture_color = np.array([0, 255 * s_texture, 255 * s_texture], dtype=np.float32)  # yellow-ish
+    asym_left_color  = np.array([0, 255 * s_asym, 0], dtype=np.float32)   # green
+    asym_right_color = np.array([255 * s_asym, 0, 255 * s_asym], dtype=np.float32) # purple
+
+    # apply colors to zones (masks are uint8 images 0/255)
+    if masks.get("upper") is not None:
+        mask_arr = (masks["upper"] > 0)
+        heatmap[mask_arr] += upper_color
+
+    if masks.get("lower") is not None:
+        mask_arr = (masks["lower"] > 0)
+        heatmap[mask_arr] += lower_color
+
+    if masks.get("total") is not None:
+        mask_arr = (masks["total"] > 0)
+        heatmap[mask_arr] += texture_color
+
+    # asymmetry: tint the side depending on asym_lr sign
+    left_mask = (masks.get("left") is not None) and (masks["left"] > 0)
+    right_mask = (masks.get("right") is not None) and (masks["right"] > 0)
+
+    if abs(asym_lr) > 0.1:
+        if asym_lr > 0:
+            if left_mask is not False:
+                heatmap[left_mask] += asym_left_color
+        else:
+            if right_mask is not False:
+                heatmap[right_mask] += asym_right_color
+
+    # clip and convert heatmap to uint8
+    heatmap = np.clip(heatmap, 0, 255).astype(np.uint8)
+
+    # blended overlay
+    overlay = cv2.addWeighted(base, 0.70, heatmap, 0.30, 0)
+
+    return overlay
+
+
+# -------------------------
 # FEATURE EXTRACTION
-
+# -------------------------
 def extract_intensity_features(region):
     pixels = region[region > 0]
     if len(pixels) == 0:
         return {"mean": 0, "std": 0, "skew": 0, "p90": 0, "p10": 0}
     return {
-        "mean": np.mean(pixels),
-        "std": np.std(pixels),
-        "skew": skew(pixels),
-        "p90": np.percentile(pixels, 90),
-        "p10": np.percentile(pixels, 10),
+        "mean": float(np.mean(pixels)),
+        "std": float(np.std(pixels)),
+        "skew": float(skew(pixels)),
+        "p90": float(np.percentile(pixels, 90)),
+        "p10": float(np.percentile(pixels, 10)),
     }
 
 
@@ -89,10 +174,10 @@ def extract_glcm_features(region):
     region_u8 = cv2.normalize(region, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     glcm = graycomatrix(region_u8, [1], [0], 256, symmetric=True, normed=True)
     return {
-        "glcm_contrast": graycoprops(glcm, "contrast")[0, 0],
-        "glcm_homogeneity": graycoprops(glcm, "homogeneity")[0, 0],
-        "glcm_energy": graycoprops(glcm, "energy")[0, 0],
-        "glcm_correlation": graycoprops(glcm, "correlation")[0, 0],
+        "glcm_contrast": float(graycoprops(glcm, "contrast")[0, 0]),
+        "glcm_homogeneity": float(graycoprops(glcm, "homogeneity")[0, 0]),
+        "glcm_energy": float(graycoprops(glcm, "energy")[0, 0]),
+        "glcm_correlation": float(graycoprops(glcm, "correlation")[0, 0]),
     }
 
 
@@ -100,10 +185,12 @@ def extract_lbp_features(region):
     region_u8 = cv2.normalize(region, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     lbp = local_binary_pattern(region_u8, P=8, R=1, method="uniform")
     hist, _ = np.histogram(lbp, bins=10, range=(0, 10), density=True)
-    return {f"lbp_bin_{i}": hist[i] for i in range(10)}
+    return {f"lbp_bin_{i}": float(hist[i]) for i in range(10)}
 
 
 def apply_mask(img, mask):
+    if mask is None:
+        return np.zeros_like(img)
     return img * ((mask > 0).astype(np.uint8))
 
 
@@ -130,92 +217,152 @@ def extract_features_single_image(image_path, mask_dir, base_name):
         features.update({f"{zone}_{k}": v for k, v in glcm.items()})
         features.update({f"{zone}_{k}": v for k, v in lbp.items()})
 
-    # asymmetry
+    # asymmetry (intensity-based)
     features["asym_upper_lower"] = (
-        features["upper_mean"] - features["lower_mean"]
-    ) / (features["upper_mean"] + features["lower_mean"] + 1e-6)
+        features.get("upper_mean", 0.0) - features.get("lower_mean", 0.0)
+    ) / (features.get("upper_mean", 0.0) + features.get("lower_mean", 0.0) + 1e-6)
 
     features["asym_left_right"] = (
-        features["left_mean"] - features["right_mean"]
-    ) / (features["left_mean"] + features["right_mean"] + 1e-6)
+        features.get("left_mean", 0.0) - features.get("right_mean", 0.0)
+    ) / (features.get("left_mean", 0.0) + features.get("right_mean", 0.0) + 1e-6)
 
     return features
 
 
+# -------------------------
+# NEW: CLINICAL SCORING (robust per-image z-scores)
+# -------------------------
+def _zscores(values):
+    """
+    Compute z-scores across a small array of values.
+    Returns list of z-scores clipped to [-3, 3].
+    """
+    arr = np.array(values, dtype=np.float32)
+    mu = np.nanmean(arr)
+    sigma = np.nanstd(arr) + 1e-6
+    zs = (arr - mu) / sigma
+    zs = np.clip(zs, -3.0, 3.0)
+    return zs.tolist()
 
-# CLINICAL SCORING AND EXPLANATION
 
 def compute_clinical_scores(features):
-    def nz(x): return float(x) if not np.isnan(x) else 0
+    """
+    Returns four clinical subscores:
+      - Upper_zone_opacity_score
+      - Lower_zone_consolidation_score
+      - Miliary_texture_score
+      - Left_right_asymmetry_score
+    Scoring strategy:
+      - use per-image z-scores across zones so scores indicate relative abnormality
+      - combine z-scores with domain weights, clip, then map to [0,1] with sigmoid
+    """
+    # safe getters
+    u_mean = float(features.get("upper_mean", 0.0))
+    l_mean = float(features.get("lower_mean", 0.0))
+    left_mean = float(features.get("left_mean", 0.0))
+    right_mean = float(features.get("right_mean", 0.0))
 
-    upper_std = nz(features["upper_std"])
-    lower_std = nz(features["lower_std"])
-    upper_contrast = nz(features["upper_glcm_contrast"])
-    lower_contrast = nz(features["lower_glcm_contrast"])
+    u_tex = float(features.get("upper_glcm_contrast", 0.0))
+    l_tex = float(features.get("lower_glcm_contrast", 0.0))
+    left_tex = float(features.get("left_glcm_contrast", 0.0))
+    right_tex = float(features.get("right_glcm_contrast", 0.0))
+    total_tex = float(features.get("total_glcm_contrast", 0.0))
 
-    def norm(x): 
-        arr = np.array([upper_std, lower_std])
-        return (x - arr.mean()) / (arr.std() + 1e-6)
+    u_std = float(features.get("upper_std", 0.0))
+    l_std = float(features.get("lower_std", 0.0))
+    left_std = float(features.get("left_std", 0.0))
+    right_std = float(features.get("right_std", 0.0))
+    total_std = float(features.get("total_std", 0.0))
 
-    score_upper = sigmoid(
-        0.6 * norm(upper_std) +
-        0.4 * norm(upper_contrast) +
-        0.3 * nz(features["asym_upper_lower"])
-    )
+    # LBP total mean (hist sums to 1, so mean is in [0,1])
+    lbp_vals = [float(features.get(f"total_lbp_bin_{i}", 0.0)) for i in range(10)]
+    lbp_mean = float(np.mean(lbp_vals))
 
-    score_lower = sigmoid(
-        0.6 * norm(lower_std) +
-        0.4 * norm(lower_contrast) -
-        0.3 * nz(features["asym_upper_lower"])
-    )
+    # 1) compute z-scores across means (upper, lower, left, right)
+    mean_z = _zscores([u_mean, l_mean, left_mean, right_mean])
+    u_mean_z, l_mean_z, left_mean_z, right_mean_z = mean_z
 
-    score_asym = sigmoid(abs(nz(features["asym_left_right"])) * 3)
+    # 2) compute z-scores across texture (upper, lower, left, right, total)
+    tex_z = _zscores([u_tex, l_tex, left_tex, right_tex, total_tex])
+    # find indices: we need u_tex_z, l_tex_z, total_tex_z
+    u_tex_z, l_tex_z, left_tex_z, right_tex_z, total_tex_z = tex_z
 
-    lbp_vals = [nz(features[f"total_lbp_bin_{i}"]) for i in range(10)]
+    # 3) compute z-scores for stds
+    std_z = _zscores([u_std, l_std, left_std, right_std, total_std])
+    u_std_z, l_std_z, left_std_z, right_std_z, total_std_z = std_z
 
-    score_texture = sigmoid(
-        0.5 * nz(features["total_glcm_contrast"]) +
-        0.3 * nz(features["total_std"]) +
-        0.2 * np.mean(lbp_vals)
-    )
+    # apical dominance = upper_mean_z - lower_mean_z
+    apical_z = u_mean_z - l_mean_z
+
+    # Build raw scores (weighted sums of z-scores)
+    # Tuning multipliers chosen so typical differences produce raw in [-3, 3]
+    raw_upper = 0.9 * u_mean_z + 0.7 * u_tex_z + 0.6 * apical_z
+    raw_lower = 0.9 * l_mean_z + 0.7 * l_tex_z - 0.6 * apical_z
+    raw_miliary = 0.9 * total_std_z + 0.8 * total_tex_z + 0.6 * (lbp_mean - 0.1)  # lbp_mean offset
+    # asymmetry uses relative left-right intensity diff (z)
+    asym_lr = (left_mean - right_mean) / ( (left_mean + right_mean) / 2.0 + 1e-6 )
+    raw_asym = abs((left_mean_z - right_mean_z)) + 0.5 * abs(asym_lr)
+
+    # clip raw scores to reasonable window before sigmoid
+    raw_upper = float(np.clip(raw_upper, -3.0, 3.0))
+    raw_lower = float(np.clip(raw_lower, -3.0, 3.0))
+    raw_miliary = float(np.clip(raw_miliary, -3.0, 3.0))
+    raw_asym = float(np.clip(raw_asym, -3.0, 3.0))
+
+    # map raw -> 0..1 with sigmoid scaled to increase separation
+    SCALE = 1.6
+    score_upper = float(sigmoid(raw_upper * SCALE))
+    score_lower = float(sigmoid(raw_lower * SCALE))
+    score_miliary = float(sigmoid(raw_miliary * SCALE))
+    score_asym = float(sigmoid(raw_asym * SCALE))
 
     return {
-        "Upper_lung_abnormality": float(score_upper),
-        "Lower_lung_abnormality": float(score_lower),
-        "Left_right_asymmetry": float(score_asym),
-        "Global_texture_score": float(score_texture)
+        "Upper_zone_opacity_score": score_upper,
+        "Lower_zone_consolidation_score": score_lower,
+        "Miliary_texture_score": score_miliary,
+        "Left_right_asymmetry_score": score_asym
     }
 
+
+# -------------------------
+# EXPLANATION
+# -------------------------
 def generate_explanation(scores, prob_tb):
-    # If model confidently says normal
+    """
+    Produces a human-readable explanation based on dominant subscore,
+    while respecting a strong 'normal' cutoff from the classifier probability.
+    """
+    u = scores.get("Upper_zone_opacity_score", 0.0)
+    l = scores.get("Lower_zone_consolidation_score", 0.0)
+    m = scores.get("Miliary_texture_score", 0.0)
+    a = scores.get("Left_right_asymmetry_score", 0.0)
+
+    # if classifier says normal strongly, prefer that message
     if prob_tb < 0.20:
-        return "Model sangat yakin bahwa paru dalam kondisi normal tanpa indikasi TB."
+        return "Model sangat yakin bahwa paru dalam kondisi normal tanpa indikasi tuberkulosis."
 
-    # Otherwise fall back to heuristic explanation
-    u, l, a, t = scores.values()
+    # if none strong
+    if max(u, l, m, a) < 0.55:
+        return "Tidak terdapat pola radiologis dominan yang mengarah kuat ke tuberkulosis."
 
-    if max(u, l, a, t) < 0.55:
-        return "Tidak terdapat temuan radiologis signifikan yang mengarah ke TB."
+    # dominant explanation by highest subscore
+    max_key = max(scores, key=scores.get)
+    if max_key == "Upper_zone_opacity_score":
+        return "Terdapat peningkatan opasitas dan tekstur kasar pada zona atas paru, konsisten dengan TB post-primary."
+    if max_key == "Lower_zone_consolidation_score":
+        return "Pola konsolidasi pada zona bawah paru dapat mengarah ke TB primer atau infeksi bakteri lainnya."
+    if max_key == "Miliary_texture_score":
+        return "Tekstur paru difus / granular terdeteksi — pola yang dapat sesuai dengan miliary tuberculosis."
+    if max_key == "Left_right_asymmetry_score":
+        return "Terdapat asimetri signifikan antara paru kiri dan kanan, mengarah ke infiltrat unilateral."
 
-    if u > 0.65 and t > 0.7:
-        return "Dominant coarse texture pada upper lobe mengarah ke TB post-primary."
-    if l > 0.65:
-        return "Abnormalitas signifikan pada lower lobe, curiga TB primer."
-    if a > 0.65:
-        return "Asimetri kuat antara paru kiri dan kanan, indikasi infiltrat unilateral."
-    if t > 0.7:
-        return "Tekstur paru menunjukkan pola kasar khas TB aktif."
-
-    return "Temuan paru tidak spesifik. Evaluasi klinis lanjutan dapat dipertimbangkan."
-
-
+    return "Temuan radiologis tidak spesifik; pertimbangkan evaluasi klinis lanjutan."
 
 
-
+# -------------------------
 # PREDICTION FUNCTION
-
+# -------------------------
 def predict_tb(image_path):
-
     # 1. Segment lung → generate masks
     base_name = os.path.splitext(os.path.basename(image_path))[0]
     mask_dir = segment_lung(image_path, base_name)
@@ -229,26 +376,49 @@ def predict_tb(image_path):
     # 3. Extract features
     features = extract_features_single_image(image_path, mask_dir, base_name)
 
-    # 4. Convert to vector
+    # 4. Convert to vector (respect feature_names from training)
     vector_df = pd.DataFrame([features], columns=feature_names)
     scaled = scaler.transform(vector_df)
 
     # 5. Prediction
     prob_tb = model.predict_proba(scaled)[0][1]
-    prob_normal = 1 - prob_tb
+    prob_normal = 1.0 - prob_tb
 
     # 6. Clinical scoring + explanation
     clinical = compute_clinical_scores(features)
     explanation = generate_explanation(clinical, float(prob_tb))
+
+    # --- Map clinical keys for heatmap (safe fallbacks) ---
+    heatmap_scores = {
+        "Upper_zone_score": clinical.get("Upper_zone_opacity_score", 0.0),
+        "Lower_zone_score": clinical.get("Lower_zone_consolidation_score", 0.0),
+        "Texture_score": clinical.get("Miliary_texture_score", 0.0),
+        "Asymmetry_score": clinical.get("Left_right_asymmetry_score", 0.0),
+        "asym_left_right": features.get("asym_left_right", 0.0)
+    }
+
+    # Load masks for heatmap
+    mask_imgs = {
+        "upper": cv2.imread(os.path.join(mask_dir, base_name + "_upper.png"), 0),
+        "lower": cv2.imread(os.path.join(mask_dir, base_name + "_lower.png"), 0),
+        "left":  cv2.imread(os.path.join(mask_dir, base_name + "_left.png"), 0),
+        "right": cv2.imread(os.path.join(mask_dir, base_name + "_right.png"), 0),
+        "total": cv2.imread(os.path.join(mask_dir, base_name + "_total.png"), 0),
+    }
+
+    original_img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+
+    heatmap_overlay = generate_zonal_heatmap(original_img, mask_imgs, heatmap_scores)
+
+    # Save heatmap image
+    heatmap_path = os.path.join(TMP_MASK_DIR, f"{base_name}_overlay.png")
+    cv2.imwrite(heatmap_path, heatmap_overlay)
 
     return {
         "image": image_path,
         "probability_TB": float(prob_tb),
         "probability_Normal": float(prob_normal),
         "clinical_groups": clinical,
-        "explanation": explanation
+        "explanation": explanation,
+        "heatmap_path": heatmap_path
     }
-
-# USAGE EXAMPLE
-# result = predict_tb("path_to_cxr_image.png")
-# print(result) 
