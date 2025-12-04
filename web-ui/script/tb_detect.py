@@ -76,85 +76,6 @@ def segment_lung(image_path, output_prefix):
 
 
 # -------------------------
-# HEATMAP GENERATION
-# -------------------------
-def generate_zonal_heatmap(original_img, masks, scores):
-    """
-    Create a heatmap overlay based on zonal clinical abnormality scores.
-    Accepts `scores` dict with keys:
-      - Upper_zone_score or Upper_zone_opacity_score
-      - Lower_zone_score or Lower_zone_consolidation_score
-      - Texture_score or Miliary_texture_score
-      - Asymmetry_score or Left_right_asymmetry_score
-      - asym_left_right (numeric signed asymmetry)
-    """
-    # ensure grayscale -> BGR
-    if len(original_img.shape) == 2:
-        base = cv2.cvtColor(original_img, cv2.COLOR_GRAY2BGR)
-    else:
-        base = original_img.copy()
-
-    heatmap = np.zeros_like(base, dtype=np.float32)
-
-    # robust access to clinical keys (supports older and newer names)
-    s_upper = float(scores.get("Upper_zone_score",
-                 scores.get("Upper_zone_opacity_score", 0.0)))
-    s_lower = float(scores.get("Lower_zone_score",
-                 scores.get("Lower_zone_consolidation_score", 0.0)))
-    s_texture = float(scores.get("Texture_score",
-                   scores.get("Miliary_texture_score", 0.0)))
-    s_asym = float(scores.get("Asymmetry_score",
-               scores.get("Left_right_asymmetry_score", 0.0)))
-    asym_lr = float(scores.get("asym_left_right", 0.0))
-
-    # clamp 0..1
-    s_upper = np.clip(s_upper, 0.0, 1.0)
-    s_lower = np.clip(s_lower, 0.0, 1.0)
-    s_texture = np.clip(s_texture, 0.0, 1.0)
-    s_asym = np.clip(s_asym, 0.0, 1.0)
-
-    # color definitions (BGR arrays)
-    upper_color = np.array([0, 0, 255 * s_upper], dtype=np.float32)       # red-ish
-    lower_color = np.array([255 * s_lower, 0, 0], dtype=np.float32)       # blue-ish
-    texture_color = np.array([0, 255 * s_texture, 255 * s_texture], dtype=np.float32)  # yellow-ish
-    asym_left_color  = np.array([0, 255 * s_asym, 0], dtype=np.float32)   # green
-    asym_right_color = np.array([255 * s_asym, 0, 255 * s_asym], dtype=np.float32) # purple
-
-    # apply colors to zones (masks are uint8 images 0/255)
-    if masks.get("upper") is not None:
-        mask_arr = (masks["upper"] > 0)
-        heatmap[mask_arr] += upper_color
-
-    if masks.get("lower") is not None:
-        mask_arr = (masks["lower"] > 0)
-        heatmap[mask_arr] += lower_color
-
-    if masks.get("total") is not None:
-        mask_arr = (masks["total"] > 0)
-        heatmap[mask_arr] += texture_color
-
-    # asymmetry: tint the side depending on asym_lr sign
-    left_mask = (masks.get("left") is not None) and (masks["left"] > 0)
-    right_mask = (masks.get("right") is not None) and (masks["right"] > 0)
-
-    if abs(asym_lr) > 0.1:
-        if asym_lr > 0:
-            if left_mask is not False:
-                heatmap[left_mask] += asym_left_color
-        else:
-            if right_mask is not False:
-                heatmap[right_mask] += asym_right_color
-
-    # clip and convert heatmap to uint8
-    heatmap = np.clip(heatmap, 0, 255).astype(np.uint8)
-
-    # blended overlay
-    overlay = cv2.addWeighted(base, 0.70, heatmap, 0.30, 0)
-
-    return overlay
-
-
-# -------------------------
 # FEATURE EXTRACTION
 # -------------------------
 def extract_intensity_features(region):
@@ -388,37 +309,10 @@ def predict_tb(image_path):
     clinical = compute_clinical_scores(features)
     explanation = generate_explanation(clinical, float(prob_tb))
 
-    # --- Map clinical keys for heatmap (safe fallbacks) ---
-    heatmap_scores = {
-        "Upper_zone_score": clinical.get("Upper_zone_opacity_score", 0.0),
-        "Lower_zone_score": clinical.get("Lower_zone_consolidation_score", 0.0),
-        "Texture_score": clinical.get("Miliary_texture_score", 0.0),
-        "Asymmetry_score": clinical.get("Left_right_asymmetry_score", 0.0),
-        "asym_left_right": features.get("asym_left_right", 0.0)
-    }
-
-    # Load masks for heatmap
-    mask_imgs = {
-        "upper": cv2.imread(os.path.join(mask_dir, base_name + "_upper.png"), 0),
-        "lower": cv2.imread(os.path.join(mask_dir, base_name + "_lower.png"), 0),
-        "left":  cv2.imread(os.path.join(mask_dir, base_name + "_left.png"), 0),
-        "right": cv2.imread(os.path.join(mask_dir, base_name + "_right.png"), 0),
-        "total": cv2.imread(os.path.join(mask_dir, base_name + "_total.png"), 0),
-    }
-
-    original_img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-
-    heatmap_overlay = generate_zonal_heatmap(original_img, mask_imgs, heatmap_scores)
-
-    # Save heatmap image
-    heatmap_path = os.path.join(TMP_MASK_DIR, f"{base_name}_overlay.png")
-    cv2.imwrite(heatmap_path, heatmap_overlay)
-
     return {
         "image": image_path,
         "probability_TB": float(prob_tb),
         "probability_Normal": float(prob_normal),
         "clinical_groups": clinical,
         "explanation": explanation,
-        "heatmap_path": heatmap_path
     }
